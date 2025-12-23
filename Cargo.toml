@@ -1,0 +1,45 @@
+[package]
+name = "mt4_client"
+version = "0.1.0"
+edition = "2021"
+description = "MT4 WebSocket Client Library"
+license = "MIT"
+
+[dependencies]
+# 异步运行时
+tokio = { version = "1", features = ["full"] }
+
+# WebSocket (使用 rustls 避免 OpenSSL 依赖)
+tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
+futures-util = "0.3"
+
+# HTTP 客户端 (使用 rustls)
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+
+# 加密
+aes = "0.8"
+cbc = "0.1"
+hex = "0.4"
+
+# 序列化
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# 工具
+thiserror = "1"
+tracing = "0.1"
+url = "2"
+byteorder = "1"
+rand = "0.8"
+
+[dev-dependencies]
+tokio-test = "0.4"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[[example]]
+name = "trade_test"
+path = "examples/trade_test.rs"
+
+[[example]]
+name = "error_test"
+path = "examples/error_test.rs"
