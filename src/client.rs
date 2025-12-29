@@ -4,7 +4,7 @@ use crate::api::{Mt4Api, TokenResponse};
 use crate::crypto::Mt4Crypto;
 use crate::error::{Mt4Error, Result};
 use crate::protocol::{Command, AUTH_DATA_SIZE};
-use crate::types::{OrderUpdate, TradeRequest};
+use crate::types::{AccountInfo, Order, OrderUpdate, TradeRequest};
 use crate::LoginCredentials;
 use byteorder::{LittleEndian, WriteBytesExt};
 use futures_util::{SinkExt, StreamExt};
@@ -22,6 +22,8 @@ pub enum Mt4Event {
     Authenticated,
     /// 认证失败
     AuthFailed(u8),
+    /// 账户信息
+    AccountInfo(AccountInfo),
     /// 订单更新
     OrderUpdate(OrderUpdate),
     /// 交易成功
@@ -124,6 +126,7 @@ impl Mt4Client {
         // 7. 启动读取任务
         let crypto = self.crypto.clone();
         let password = credentials.password.clone();
+        let login_id: i32 = credentials.login.parse().unwrap_or(0);
         let token = token_info.token.clone();
         let write_tx_clone = write_tx.clone();
 
@@ -159,7 +162,7 @@ impl Mt4Client {
                         let error_code = decrypted[4];
                         let msg_data = decrypted[5..].to_vec();
 
-                        tracing::debug!(
+                        tracing::info!(
                             "Received: command={}, error={}, data_len={}",
                             command,
                             error_code,
@@ -190,53 +193,269 @@ impl Mt4Client {
                                     pending_auth = false;
                                     tracing::info!("Authentication successful!");
                                     let _ = event_tx.send(Mt4Event::Authenticated).await;
+                                    // 不发送 command=5，因为那是获取订单历史，不是当前持仓
+                                    // 当前持仓通过 command=10 (OrderUpdate) 推送事件获取
                                 } else {
                                     tracing::error!("Authentication failed: {}", error_code);
                                     let _ = event_tx.send(Mt4Event::AuthFailed(error_code)).await;
                                 }
                             }
-                            10 => {
-                                // 订单更新
-                                if let Some(update) = OrderUpdate::from_bytes(&msg_data) {
+                            3 => {
+                                // 账户信息响应
+                                // 数据结构 (根据 JS 源码 line 1180):
+                                // - 0-253: 账户信息 (254 字节, q.Vp=254)
+                                // - 254-1161: 品种信息 (28字节*32个, parsed by Ur())
+                                // - 1162+: 报价信息 (parsed by Qr() at offset q.Dk=1162)
+                                // 注意: Command 3 不包含订单数据!
+                                // 当前持仓需要通过 Command 4 请求, 历史订单通过 Command 5 获取
+
+                                if let Some(mut account) = Self::parse_account_info(&msg_data) {
+                                    // 使用认证时的 login (响应中可能没有正确的 login)
+                                    account.login = login_id;
                                     tracing::info!(
-                                        "Order update: ticket={}, symbol={}, type={:?}",
-                                        update.order.ticket,
-                                        update.order.symbol,
-                                        update.order.order_type
+                                        "Account: login={}, balance={:.2}, equity={:.2}, leverage={}",
+                                        account.login,
+                                        account.balance,
+                                        account.equity,
+                                        account.leverage
                                     );
-                                    let _ = event_tx.send(Mt4Event::OrderUpdate(update)).await;
+                                    let _ = event_tx.send(Mt4Event::AccountInfo(account)).await;
+
+                                    // 根据 mt4.en.js line 1181: 收到 Command 3 后调用 C.F.$().lf()
+                                    // lf() 函数 (line 1216) 会发送 Command 4 请求获取当前持仓
+                                    tracing::info!("Account info received, requesting current positions (Command 4)...");
+                                    let crypto_guard = crypto.lock().await;
+                                    if let Ok(packet) = Self::build_packet(
+                                        Command::CurrentPositions as u16,
+                                        &[],
+                                        &crypto_guard,
+                                        false,
+                                    ) {
+                                        drop(crypto_guard);
+                                        if let Err(e) = write_tx_clone.send(packet).await {
+                                            tracing::error!("Failed to send Command 4 request: {}", e);
+                                        }
+                                    }
+
+                                } else {
+                                    tracing::warn!(
+                                        "Failed to parse AccountInfo: data_len={}",
+                                        msg_data.len()
+                                    );
+                                    let _ = event_tx.send(Mt4Event::RawMessage {
+                                        command,
+                                        error_code,
+                                        data: msg_data,
+                                    }).await;
+                                }
+                            }
+                            4 => {
+                                // 当前持仓订单列表 (Command 4, mb.Mm)
+                                // 根据 mt4.en.js line 1204 函数 D 和 line 1296 的 Oo() 函数：
+                                // - 这是初始化 ef[] 数组（当前持仓）的命令
+                                // - 数据格式: 161 字节 Order 结构数组（无头部）
+                                // - 使用 Sr() 函数解析 (Math.floor(byteLength/161))
+                                // - 每个订单调用 Oo() 添加到 ef[] 数组
+
+                                if msg_data.is_empty() {
+                                    tracing::info!("Command 4 (当前持仓): 空 (无持仓订单)");
+                                } else {
+                                    let order_count = msg_data.len() / 161;
+                                    tracing::info!(
+                                        "Command 4 (当前持仓): {} 个订单 ({} 字节)",
+                                        order_count,
+                                        msg_data.len()
+                                    );
+
+                                    for i in 0..order_count {
+                                        let offset = i * 161;
+                                        if let Some(order) = Order::from_bytes(&msg_data, offset) {
+                                            tracing::info!(
+                                                "持仓 #{}: ticket={}, symbol={}, type={:?}, volume={:.2}, open={:.5}, profit={:.2}",
+                                                i,
+                                                order.ticket,
+                                                order.symbol,
+                                                order.order_type,
+                                                order.volume,
+                                                order.open_price,
+                                                order.profit
+                                            );
+
+                                            // 发送为 OrderUpdate 事件
+                                            // notify_type=0 表示新订单/持仓 (对应 JS 中 T.su=0)
+                                            let update = OrderUpdate {
+                                                notify_id: 0,
+                                                notify_type: 0,  // 0=新订单/当前持仓
+                                                df: 0.0,
+                                                xh: 0.0,
+                                                raw_size: 161,
+                                                order,
+                                                related_order: None,
+                                            };
+                                            let _ = event_tx.send(Mt4Event::OrderUpdate(update)).await;
+                                        }
+                                    }
+                                }
+                            }
+                            5 => {
+                                // 订单历史响应或当前持仓响应
+                                tracing::info!(
+                                    "Command 5 response: data_len={} bytes",
+                                    msg_data.len()
+                                );
+
+                                // 输出 hex 数据以便分析
+                                if !msg_data.is_empty() {
+                                    // 输出前 200 字节
+                                    let hex_preview = msg_data.iter()
+                                        .take(200)
+                                        .map(|b| format!("{:02x}", b))
+                                        .collect::<Vec<_>>()
+                                        .join(" ");
+                                    tracing::info!("Command 5 data (first 200 bytes): {}", hex_preview);
+
+                                    // 输出前 3 个 161 字节记录的完整 hex
+                                    for i in 0..3 {
+                                        let offset = i * 161;
+                                        if msg_data.len() >= offset + 161 {
+                                            let order_hex = msg_data[offset..offset+161].iter()
+                                                .map(|b| format!("{:02x}", b))
+                                                .collect::<Vec<_>>()
+                                                .join(" ");
+                                            tracing::info!("Record #{} (161 bytes): {}", i, order_hex);
+                                        }
+                                    }
+
+                                    // 解析订单（命令 5 = 历史订单）
+                                    // 根据 mt4.en.js line 1103 的 Sr() 函数:
+                                    // 数据格式: 161 字节 Order 结构数组（无头部）
+                                    let order_count = msg_data.len() / 161;
+                                    tracing::info!("Command 5: parsing {} orders from {} bytes", order_count, msg_data.len());
+
+                                    for i in 0..order_count {
+                                        let offset = i * 161;
+                                        if let Some(order) = Order::from_bytes(&msg_data, offset) {
+                                            // 命令 5 返回的是历史订单，通常都是已平仓的
+                                            // notify_type: 1 = Close (根据 JS 中 T.Fw=1)
+                                            let is_closed = Self::is_order_closed(&order);
+                                            let notify_type = if is_closed { 1 } else { 0 };
+
+                                            tracing::info!(
+                                                "历史订单 #{}: ticket={}, symbol={}, type={:?}, volume={:.2}, open={:.5}, close={:.5}, profit={:.2}",
+                                                i, order.ticket, order.symbol, order.order_type, order.volume,
+                                                order.open_price, order.close_price, order.profit
+                                            );
+
+                                            let update = OrderUpdate {
+                                                notify_id: 0,
+                                                notify_type,
+                                                df: 0.0,
+                                                xh: 0.0,
+                                                raw_size: 161,
+                                                order,
+                                                related_order: None,
+                                            };
+                                            let _ = event_tx.send(Mt4Event::OrderUpdate(update)).await;
+                                        }
+                                    }
+                                }
+                            }
+                            10 => {
+                                // 订单更新 (实时推送) - 可能包含多个订单更新
+                                tracing::debug!(
+                                    "Order update raw: data_len={}, data_hex={:02x?}",
+                                    msg_data.len(),
+                                    &msg_data[..msg_data.len().min(32)]
+                                );
+
+                                // 解析所有订单更新（一条消息可能包含多个）
+                                let updates = OrderUpdate::parse_all(&msg_data);
+                                if updates.is_empty() {
+                                    tracing::warn!(
+                                        "Failed to parse OrderUpdate: data_len={} (expected >= 185)",
+                                        msg_data.len()
+                                    );
+                                } else {
+                                    tracing::debug!("Parsed {} order update(s) from {} bytes", updates.len(), msg_data.len());
+                                    for update in updates {
+                                        tracing::info!(
+                                            "Order update: ticket={}, symbol={}, type={:?}, notify_type={}, close_time={}",
+                                            update.order.ticket,
+                                            update.order.symbol,
+                                            update.order.order_type,
+                                            update.notify_type,
+                                            update.order.close_time
+                                        );
+                                        let _ = event_tx.send(Mt4Event::OrderUpdate(update)).await;
+                                    }
                                 }
                             }
                             12 => {
-                                // 交易响应
-                                let request_id = if msg_data.len() >= 4 {
-                                    i32::from_le_bytes([msg_data[0], msg_data[1], msg_data[2], msg_data[3]])
+                                // 交易响应 - 解析完整的响应数据
+                                if let Some(response) = crate::types::TradeResponse::from_bytes(&msg_data) {
+                                    // 检查 error_code 或 status 是否有错误
+                                    // status=0: Success, status=1: Request sent (都是成功)
+                                    // status>=2: 各种错误
+                                    if error_code != 0 {
+                                        let err = Mt4Error::from_trade_code(error_code);
+                                        if let Mt4Error::Trade { code, message } = err {
+                                            tracing::warn!(
+                                                "Trade failed (error_code): request_id={}, code={}, msg={}",
+                                                response.request_id, code, message
+                                            );
+                                            let _ = event_tx.send(Mt4Event::TradeFailed { code, message }).await;
+                                        }
+                                    } else if response.status >= 2 {
+                                        // status >= 2 才是真正的错误
+                                        let err = Mt4Error::from_trade_code(response.status as u8);
+                                        if let Mt4Error::Trade { code, message } = err {
+                                            tracing::warn!(
+                                                "Trade failed (status): request_id={}, code={}, msg={}",
+                                                response.request_id, code, message
+                                            );
+                                            let _ = event_tx.send(Mt4Event::TradeFailed { code, message }).await;
+                                        }
+                                    } else {
+                                        // status=0 (Success) 或 status=1 (Request sent) 都是成功
+                                        tracing::info!(
+                                            "Trade success: request_id={}, status={}, price1={:.5}, price2={:.5}, orders_count={}",
+                                            response.request_id, response.status, response.price1, response.price2, response.orders.len()
+                                        );
+                                        let _ = event_tx.send(Mt4Event::TradeSuccess {
+                                            request_id: response.request_id,
+                                            status: response.status
+                                        }).await;
+                                    }
                                 } else {
-                                    0
-                                };
-                                let status = if msg_data.len() >= 8 {
-                                    i32::from_le_bytes([msg_data[4], msg_data[5], msg_data[6], msg_data[7]])
-                                } else {
-                                    0
-                                };
+                                    tracing::error!("Failed to parse trade response, data_len={}", msg_data.len());
+                                    // 如果解析失败，使用旧的简单解析方式作为后备
+                                    let request_id = if msg_data.len() >= 4 {
+                                        i32::from_le_bytes([msg_data[0], msg_data[1], msg_data[2], msg_data[3]])
+                                    } else {
+                                        0
+                                    };
+                                    let status = if msg_data.len() >= 8 {
+                                        i32::from_le_bytes([msg_data[4], msg_data[5], msg_data[6], msg_data[7]])
+                                    } else {
+                                        0
+                                    };
 
-                                // 检查 error_code 或 status 是否有错误
-                                if error_code != 0 {
-                                    let err = Mt4Error::from_trade_code(error_code);
-                                    if let Mt4Error::Trade { code, message } = err {
-                                        tracing::warn!("Trade failed (error_code): code={}, msg={}", code, message);
-                                        let _ = event_tx.send(Mt4Event::TradeFailed { code, message }).await;
+                                    if error_code != 0 {
+                                        let err = Mt4Error::from_trade_code(error_code);
+                                        if let Mt4Error::Trade { code, message } = err {
+                                            tracing::warn!("Trade failed (error_code): code={}, msg={}", code, message);
+                                            let _ = event_tx.send(Mt4Event::TradeFailed { code, message }).await;
+                                        }
+                                    } else if status >= 2 {
+                                        let err = Mt4Error::from_trade_code(status as u8);
+                                        if let Mt4Error::Trade { code, message } = err {
+                                            tracing::warn!("Trade failed (status): code={}, msg={}", code, message);
+                                            let _ = event_tx.send(Mt4Event::TradeFailed { code, message }).await;
+                                        }
+                                    } else {
+                                        tracing::info!("Trade success: request_id={}, status={}", request_id, status);
+                                        let _ = event_tx.send(Mt4Event::TradeSuccess { request_id, status }).await;
                                     }
-                                } else if status != 0 {
-                                    // status 非0也是错误
-                                    let err = Mt4Error::from_trade_code(status as u8);
-                                    if let Mt4Error::Trade { code, message } = err {
-                                        tracing::warn!("Trade failed (status): code={}, msg={}", code, message);
-                                        let _ = event_tx.send(Mt4Event::TradeFailed { code, message }).await;
-                                    }
-                                } else {
-                                    tracing::info!("Trade success: request_id={}", request_id);
-                                    let _ = event_tx.send(Mt4Event::TradeSuccess { request_id, status }).await;
                                 }
                             }
                             51 => {
@@ -398,9 +617,20 @@ impl Mt4Client {
         self.send_trade(request).await
     }
 
-    /// 平仓
+    /// 平仓 (需要传入原订单方向，以便发送反向平仓)
     pub async fn close_order(&self, ticket: i32, symbol: &str, volume: f64) -> Result<()> {
         let request = TradeRequest::close(ticket, symbol, volume);
+        tracing::info!(
+            "Sending close: ticket={}, symbol={}, volume={}",
+            ticket, symbol, volume
+        );
+        self.send_trade(request).await
+    }
+
+    /// 取消挂单
+    pub async fn cancel_order(&self, ticket: i32, symbol: &str) -> Result<()> {
+        let request = TradeRequest::cancel(ticket, symbol);
+        tracing::info!("Sending cancel: ticket={}, symbol={}", ticket, symbol);
         self.send_trade(request).await
     }
 
@@ -414,9 +644,54 @@ impl Mt4Client {
         self.send_command(Command::AccountInfo, &[]).await
     }
 
-    /// 请求订单列表
-    pub async fn request_orders(&self) -> Result<()> {
+    /// 请求订单历史（注意：这是历史记录，不是当前持仓）
+    /// 当前持仓通过 command=10 (OrderUpdate) 推送事件获取
+    ///
+    /// # 参数
+    /// - `start_time`: 可选的开始时间（Unix时间戳，秒）
+    /// - `end_time`: 可选的结束时间（Unix时间戳，秒）
+    ///
+    /// 如果不提供时间范围，将返回所有历史订单
+    /// 请求当前持仓列表 (Command 4)
+    ///
+    /// 根据 mt4.en.js line 1216 的 B.lf() 函数:
+    /// - 这个请求会初始化 JavaScript 中的 ef[] 数组（当前持仓）
+    /// - 在收到 Command 3 (账户信息) 后自动调用
+    /// - 无需参数，服务器返回所有当前持仓订单
+    pub async fn request_current_positions(&self) -> Result<()> {
+        tracing::info!("Requesting current positions (Command 4)...");
+        self.send_command(Command::CurrentPositions, &[]).await
+    }
+
+    pub async fn request_order_history(&self) -> Result<()> {
         self.send_command(Command::OrdersRequest, &[]).await
+    }
+
+    /// 请求指定时间范围的订单历史
+    ///
+    /// # 参数
+    /// - `start_time`: 开始时间（Unix时间戳，秒）
+    /// - `end_time`: 结束时间（Unix时间戳，秒）
+    ///
+    /// # 示例
+    /// ```rust
+    /// // 获取最近7天的订单
+    /// let now = std::time::SystemTime::now()
+    ///     .duration_since(std::time::UNIX_EPOCH)
+    ///     .unwrap()
+    ///     .as_secs() as i32;
+    /// let seven_days_ago = now - 7 * 24 * 3600;
+    /// client.request_order_history_range(seven_days_ago, now).await?;
+    /// ```
+    pub async fn request_order_history_range(&self, start_time: i32, end_time: i32) -> Result<()> {
+        // 构造8字节的数据包
+        // 前4字节: 开始时间（Unix时间戳，秒）
+        // 后4字节: 结束时间（Unix时间戳，秒）
+        let mut data = Vec::with_capacity(8);
+        data.extend_from_slice(&start_time.to_le_bytes());
+        data.extend_from_slice(&end_time.to_le_bytes());
+
+        self.send_command(Command::OrdersRequest, &data).await
     }
 
     /// 接收下一个事件
@@ -438,6 +713,40 @@ impl Mt4Client {
         self.writer = None;
         self.event_rx = None;
         self.authenticated = false;
+    }
+
+    /// 解析账户信息响应 (command=3)
+    ///
+    /// 数据包结构 (根据 JS 源码):
+    /// - 账户信息头部 (约 254 字节，q.Vp=254)
+    /// - 品种信息 (254-1161)
+    /// - 报价信息 (1162+, q.Dk=1162)
+    fn parse_account_info(data: &[u8]) -> Option<AccountInfo> {
+        AccountInfo::from_bytes(data)
+    }
+
+    /// 判断订单是否已平仓
+    ///
+    /// 注意：历史订单中 close_time 字段可能未填充（为0），
+    /// 所以我们用 close_price 来判断：
+    /// - 如果 close_price > 0 且 != open_price，认为已平仓
+    /// - 或者如果有明确的 close_time > 0，也认为已平仓
+    fn is_order_closed(order: &Order) -> bool {
+        // 方法1: 有明确的平仓时间
+        if order.close_time > 0 {
+            return true;
+        }
+
+        // 方法2: close_price 有意义且不等于开仓价
+        // （允许一定的浮点误差）
+        if order.close_price > 0.0 && (order.close_price - order.open_price).abs() > 0.00001 {
+            return true;
+        }
+
+        // 方法3: 如果 profit 不为 0，可能是已平仓订单
+        // 但这个判断不够可靠，因为持仓订单也有浮动盈亏
+
+        false
     }
 }
 

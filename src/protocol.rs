@@ -17,9 +17,10 @@ pub enum Command {
     Logout = 2,
     /// 请求账户信息
     AccountInfo = 3,
-    /// 请求品种信息
-    SymbolInfo = 4,
-    /// 请求订单列表
+    /// 请求当前持仓 (Command 4, mt4.en.js Mm)
+    /// 对应 JavaScript 中的 ef[] 数组初始化
+    CurrentPositions = 4,
+    /// 请求历史订单 (Command 5, mt4.en.js Km)
     OrdersRequest = 5,
     /// 请求历史记录
     HistoryRequest = 6,
@@ -59,7 +60,7 @@ impl Command {
             1 => Some(Command::AuthPassword),
             2 => Some(Command::Logout),
             3 => Some(Command::AccountInfo),
-            4 => Some(Command::SymbolInfo),
+            4 => Some(Command::CurrentPositions),
             5 => Some(Command::OrdersRequest),
             6 => Some(Command::HistoryRequest),
             8 => Some(Command::QuotesRequest),

@@ -1,6 +1,6 @@
 [package]
 name = "mt4_client"
-version = "0.1.0"
+version = "0.3.0"
 edition = "2021"
 description = "MT4 WebSocket Client Library"
 license = "MIT"
@@ -35,6 +35,7 @@ rand = "0.8"
 [dev-dependencies]
 tokio-test = "0.4"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+chrono = "0.4"
 
 [[example]]
 name = "trade_test"

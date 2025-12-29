@@ -183,8 +183,22 @@ client.close_order(12345678, "EURUSD", 0.01).await?;
 // 请求账户信息
 client.request_account_info().await?;
 
-// 请求订单列表
-client.request_orders().await?;
+// 请求订单历史 (所有历史订单)
+client.request_order_history().await?;
+
+// 请求指定时间范围的订单历史
+let now = std::time::SystemTime::now()
+    .duration_since(std::time::UNIX_EPOCH)
+    .unwrap()
+    .as_secs() as i32;
+
+// 获取最近7天的订单
+let seven_days_ago = now - 7 * 24 * 3600;
+client.request_order_history_range(seven_days_ago, now).await?;
+
+// 获取最近24小时的订单
+let one_day_ago = now - 24 * 3600;
+client.request_order_history_range(one_day_ago, now).await?;
 
 // 发送心跳 (每30秒调用一次)
 client.ping().await?;
@@ -314,11 +328,37 @@ Payload 结构 (解密后):
 | 1 | AUTH_PASSWORD | 发送/接收 | 发送密码 (64字节 UTF-16 LE) / 认证响应 |
 | 2 | LOGOUT | 发送 | 登出 |
 | 3 | ACCOUNT_INFO | 发送/接收 | 请求/接收账户信息 |
-| 5 | ORDERS_REQUEST | 发送 | 请求订单列表 |
+| 5 | ORDERS_REQUEST | 发送 | 请求订单历史 (可选时间范围，见下方说明) |
 | 10 | ORDER_UPDATE | 接收 | 订单更新通知 (185字节) |
 | 11 | CHART_REQUEST | 发送 | K线历史请求 |
 | 12 | TRADE_REQUEST | 发送/接收 | 交易请求/响应 |
 | 51 | PING | 发送/接收 | 心跳 |
+
+#### Command 5 (ORDERS_REQUEST) 数据格式
+
+**无参数格式** (返回所有历史订单):
+```
+无数据，仅发送命令 ID
+```
+
+**时间范围格式** (8字节):
+```
+Offset  Size  Type     Field         说明
+------  ----  -------  -----------   ----------------------
+0       4     i32      start_time    开始时间 (Unix时间戳，秒)
+4       4     i32      end_time      结束时间 (Unix时间戳，秒)
+```
+
+**示例**:
+```rust
+// 无参数 - 获取所有历史订单
+client.request_order_history().await?;
+
+// 带时间范围 - 只获取指定时间段的订单
+let start = 1704067200;  // 2024-01-01 00:00:00
+let end = 1735689600;    // 2025-01-01 00:00:00
+client.request_order_history_range(start, end).await?;
+```
 
 ### 5. 交易请求格式 (95字节)
 
@@ -369,13 +409,22 @@ Offset  Size  Type     Field       说明
 
 ## 数据结构
 
-### 订单更新 (Command 10, 185字节)
+### 订单更新 (Command 10)
+
+订单更新有两种格式:
+
+| 大小 | 类型 | 说明 |
+|------|------|------|
+| 185 字节 | 标准订单更新 | 单个订单的开仓/平仓/修改通知 |
+| 370 字节 | 对冲平仓 (Close By) | 包含两个订单: 被平仓单 + 对冲单 |
+
+#### 标准格式 (185字节)
 
 ```
 Offset  Size  Type     Field         说明
 ------  ----  -------  -----------   ----------------------
 0       4     i32      notify_id     通知 ID
-4       4     i32      notify_type   通知类型
+4       4     i32      notify_type   通知类型 (1=更新)
 8       16    -        reserved      保留
 
 --- 订单数据 (从 offset 24 开始, 161字节) ---
@@ -390,7 +439,7 @@ Offset  Size  Type     Field         说明
 60      8     f64      open_price    开仓价
 68      8     f64      sl            止损
 76      8     f64      tp            止盈
-84      4     i32      close_time    平仓时间
+84      4     i32      close_time    平仓时间 (0=持仓中)
 88      4     i32      expiration    过期时间
 92      1     i8       unknown       -
 93      8     f64      commission    佣金
@@ -402,6 +451,55 @@ Offset  Size  Type     Field         说明
 141     4     i32      unknown       -
 145     32    char[]   comment       注释 (UTF-8)
 177     8     f64      unknown       -
+```
+
+#### 对冲平仓格式 (370字节)
+
+当使用 "Close By" (对冲平仓) 操作时，服务器发送 370 字节的数据包:
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│  Header (24字节)  │  Order 1 (161字节)  │  Order 2 (185字节)    │
+│  notify_id/type   │  被平仓的订单        │  对冲订单的完整更新    │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+#### Rust 结构体
+
+```rust
+pub struct OrderUpdate {
+    pub notify_id: i32,
+    pub notify_type: i32,
+    pub raw_size: usize,           // 原始数据包大小
+    pub order: Order,              // 主订单
+    pub related_order: Option<Order>, // 关联订单 (Close By 时存在)
+}
+
+impl OrderUpdate {
+    /// 是否为平仓通知
+    pub fn is_close_notification(&self) -> bool;
+
+    /// 是否为对冲平仓 (Close By)
+    pub fn is_close_by(&self) -> bool;
+}
+```
+
+#### 使用示例
+
+```rust
+Mt4Event::OrderUpdate(update) => {
+    if update.is_close_by() {
+        println!("对冲平仓!");
+        println!("订单1: #{}", update.order.ticket);
+        if let Some(ref related) = update.related_order {
+            println!("订单2: #{}", related.ticket);
+        }
+    } else if update.is_close_notification() {
+        println!("订单已平仓: #{}", update.order.ticket);
+    } else {
+        println!("订单更新: #{}", update.order.ticket);
+    }
+}
 ```
 
 ---
@@ -444,6 +542,8 @@ Offset  Size  Type     Field         说明
 
 ## 示例项目
 
+### trade_test - 订单监控示例
+
 运行测试:
 
 ```bash
@@ -453,6 +553,32 @@ cargo run --example trade_test -- <login> <password> <server>
 # 示例
 cargo run --example trade_test -- 31313724 password ICMarketsSC-Demo03
 ```
+
+**功能特性**:
+- 实时监控订单更新（持仓、平仓、修改等）
+- CSV格式输出，便于数据分析和导入Excel
+- 自动记录到 `orders.log` 文件
+- 支持对冲平仓（Close By）订单显示
+
+**CSV输出格式**:
+```csv
+时间,通知类型,订单号,品种,类型,手数,开仓价,平仓价,止损,止盈,盈亏,佣金,隔夜利息,开仓时间,平仓时间,注释
+2025-12-29 10:28:09,持仓中/新订单,534483380,GBPUSD,Sell,0.00,1.34153,1.34153,0.00000,0.00000,1.34,0.00,0.00,1766398846,0,
+2025-12-29 10:28:09,已平仓,534483381,EURUSD,Buy,0.01,1.05234,1.05256,0.00000,0.00000,2.20,0.00,0.00,1766398850,1766398900,
+```
+
+**字段说明**:
+- 时间: 记录时间（YYYY-MM-DD HH:MM:SS）
+- 通知类型: 持仓中/新订单、已平仓、订单修改、订单删除、对冲单
+- 订单号: MT4订单号
+- 品种: 交易品种（如GBPUSD、AUDUSD）
+- 类型: 订单类型（Buy、Sell、BuyLimit、SellLimit等）
+- 手数: 交易手数
+- 开仓价/平仓价: 价格（5位小数）
+- 止损/止盈: 止损止盈价格
+- 盈亏/佣金/隔夜利息: 费用信息
+- 开仓时间/平仓时间: Unix时间戳（秒）
+- 注释: 订单备注
 
 ---
 
