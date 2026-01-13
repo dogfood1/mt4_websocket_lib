@@ -1,0 +1,100 @@
+{
+    // 使用 IntelliSense 了解相关属性。 
+    // 悬停以查看现有属性的描述。
+    // 欲了解更多信息，请访问: https://go.microsoft.com/fwlink/?linkid=830387
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Debug example 'trade_test'",
+            "type": "lldb",
+            "request": "launch",
+            "cargo": {
+                "args": [
+                    "run",
+                    "--example=trade_test"
+                ]
+            },
+            "args": []
+        },
+    
+        {
+            "name": "Debug unit tests in library 'mt4_client'",
+            "type": "lldb",
+            "request": "launch",
+            "cargo": {
+                "args": [
+                    "test"
+                ]
+            }
+        },
+        {
+            "name": "Debug executable 'mt4_client'",
+            "type": "lldb",
+            "request": "launch",
+            "cargo": {
+                "args": [
+                    "run",
+                    "--bin=mt4_client"
+                ]
+            },
+            "args": []
+        },
+        {
+            "name": "Debug unit tests in executable 'mt4_client'",
+            "type": "lldb",
+            "request": "launch",
+            "cargo": {
+                "args": [
+                    "test",
+                    "--bin=mt4_client"
+                ]
+            }
+        },
+        {
+            "name": "Debug example 'error_test'",
+            "type": "lldb",
+            "request": "launch",
+            "cargo": {
+                "args": [
+                    "run",
+                    "--example=error_test"
+                ]
+            },
+            "args": []
+        },
+        {
+            "name": "Debug unit tests in example 'error_test'",
+            "type": "lldb",
+            "request": "launch",
+            "cargo": {
+                "args": [
+                    "test",
+                    "--example=error_test"
+                ]
+            }
+        },
+        {
+            "name": "Debug example 'trade_test'",
+            "type": "lldb",
+            "request": "launch",
+            "cargo": {
+                "args": [
+                    "run",
+                    "--example=trade_test"
+                ]
+            },
+            "args": []
+        },
+        {
+            "name": "Debug unit tests in example 'trade_test'",
+            "type": "lldb",
+            "request": "launch",
+            "cargo": {
+                "args": [
+                    "test",
+                    "--example=trade_test"
+                ]
+            }
+        }
+    ]
+}

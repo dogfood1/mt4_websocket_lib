@@ -24,8 +24,17 @@ pub enum Mt4Event {
     AuthFailed(u8),
     /// 账户信息
     AccountInfo(AccountInfo),
-    /// 订单更新
+    /// 订单更新（实时推送，Command 10）- 单个订单
     OrderUpdate(OrderUpdate),
+    /// 批量订单更新（实时推送，Command 10）- 多个订单一起推送
+    /// MT4 对冲平仓等操作会一次性推送多个订单更新
+    OrderUpdates(Vec<OrderUpdate>),
+    /// 持仓快照（Command 4 响应，包含所有当前持仓）
+    /// 用于同步本地缓存：不在快照中的订单应被移除
+    PositionsSnapshot(Vec<Order>),
+    /// 历史订单（Command 5 响应，包含已平仓订单）
+    /// 这些订单不应触发跟单逻辑，仅用于显示和导出
+    HistoryOrders(Vec<Order>),
     /// 交易成功
     TradeSuccess { request_id: i32, status: i32 },
     /// 交易失败
@@ -80,6 +89,21 @@ impl Mt4Client {
         // 1. 获取 token
         let token_info = self.api.get_token(&credentials.login, &credentials.server, 4).await?;
         tracing::info!("Token received: {}", &token_info.token[..20.min(token_info.token.len())]);
+
+        // 验证服务器是否匹配（API 可能返回不同的服务器）
+        if token_info.trade_server != credentials.server {
+            tracing::warn!(
+                "⚠️ 服务器不匹配! 请求: {}, API返回: {}",
+                credentials.server,
+                token_info.trade_server
+            );
+            return Err(Mt4Error::Server(format!(
+                "服务器配置错误: 账户 {} 属于服务器 {}，而非 {}",
+                credentials.login,
+                token_info.trade_server,
+                credentials.server
+            )));
+        }
 
         // 2. 设置会话密钥
         {
@@ -257,8 +281,17 @@ impl Mt4Client {
                                 // - 使用 Sr() 函数解析 (Math.floor(byteLength/161))
                                 // - 每个订单调用 Oo() 添加到 ef[] 数组
 
+                                let mut orders = Vec::new();
+
+                                // 记录原始数据长度和 error_code，便于诊断
+                                tracing::info!(
+                                    "Command 4 响应: error_code={}, data_len={} 字节",
+                                    error_code,
+                                    msg_data.len()
+                                );
+
                                 if msg_data.is_empty() {
-                                    tracing::info!("Command 4 (当前持仓): 空 (无持仓订单)");
+                                    tracing::warn!("Command 4 (当前持仓): 空数据 (无持仓订单或服务器未返回)");
                                 } else {
                                     let order_count = msg_data.len() / 161;
                                     tracing::info!(
@@ -280,22 +313,13 @@ impl Mt4Client {
                                                 order.open_price,
                                                 order.profit
                                             );
-
-                                            // 发送为 OrderUpdate 事件
-                                            // notify_type=0 表示新订单/持仓 (对应 JS 中 T.su=0)
-                                            let update = OrderUpdate {
-                                                notify_id: 0,
-                                                notify_type: 0,  // 0=新订单/当前持仓
-                                                df: 0.0,
-                                                xh: 0.0,
-                                                raw_size: 161,
-                                                order,
-                                                related_order: None,
-                                            };
-                                            let _ = event_tx.send(Mt4Event::OrderUpdate(update)).await;
+                                            orders.push(order);
                                         }
                                     }
                                 }
+
+                                // 发送持仓快照事件（包含所有当前持仓，用于同步本地缓存）
+                                let _ = event_tx.send(Mt4Event::PositionsSnapshot(orders)).await;
                             }
                             5 => {
                                 // 订单历史响应或当前持仓响应
@@ -332,41 +356,53 @@ impl Mt4Client {
                                     let order_count = msg_data.len() / 161;
                                     tracing::info!("Command 5: parsing {} orders from {} bytes", order_count, msg_data.len());
 
+                                    let mut history_orders = Vec::with_capacity(order_count);
                                     for i in 0..order_count {
                                         let offset = i * 161;
                                         if let Some(order) = Order::from_bytes(&msg_data, offset) {
-                                            // 命令 5 返回的是历史订单，通常都是已平仓的
-                                            // notify_type: 1 = Close (根据 JS 中 T.Fw=1)
-                                            let is_closed = Self::is_order_closed(&order);
-                                            let notify_type = if is_closed { 1 } else { 0 };
-
                                             tracing::info!(
-                                                "历史订单 #{}: ticket={}, symbol={}, type={:?}, volume={:.2}, open={:.5}, close={:.5}, profit={:.2}",
+                                                "历史订单 #{}: ticket={}, symbol={}, type={:?}, volume={:.2}, open={:.5}, close={:.5}, profit={:.2}, open_time={}, close_time={}",
                                                 i, order.ticket, order.symbol, order.order_type, order.volume,
-                                                order.open_price, order.close_price, order.profit
+                                                order.open_price, order.close_price, order.profit,
+                                                order.open_time, order.close_time
                                             );
 
-                                            let update = OrderUpdate {
-                                                notify_id: 0,
-                                                notify_type,
-                                                df: 0.0,
-                                                xh: 0.0,
-                                                raw_size: 161,
-                                                order,
-                                                related_order: None,
-                                            };
-                                            let _ = event_tx.send(Mt4Event::OrderUpdate(update)).await;
+                                            // 调试：验证修正后的时间戳解析
+                                            if i == 0 {
+                                                let ticket_bytes = &msg_data[offset..offset+4];
+                                                let open_time_bytes_new = &msg_data[offset+28..offset+32]; // 修正：offset 28-31
+                                                let close_time_bytes = &msg_data[offset+60..offset+64];
+
+                                                tracing::info!(
+                                                    "📋 [历史订单 #{}] ticket={} 时间戳验证 (修正后):\n  \
+                                                     Ticket: {:02x?}\n  \
+                                                     ✅ Open Time (offset 28-31): {:02x?} → 解析: {}\n  \
+                                                     ✅ Close Time (offset 60-63): {:02x?} → 解析: {}",
+                                                    i, order.ticket,
+                                                    ticket_bytes,
+                                                    open_time_bytes_new, order.open_time,
+                                                    close_time_bytes, order.close_time
+                                                );
+                                            }
+
+                                            history_orders.push(order);
                                         }
+                                    }
+
+                                    // 一次性发送所有历史订单（使用新的 HistoryOrders 事件）
+                                    if !history_orders.is_empty() {
+                                        tracing::info!("Command 5: 发送 {} 个历史订单到引擎", history_orders.len());
+                                        let _ = event_tx.send(Mt4Event::HistoryOrders(history_orders)).await;
                                     }
                                 }
                             }
                             10 => {
                                 // 订单更新 (实时推送) - 可能包含多个订单更新
-                                tracing::debug!(
-                                    "Order update raw: data_len={}, data_hex={:02x?}",
-                                    msg_data.len(),
-                                    &msg_data[..msg_data.len().min(32)]
-                                );
+                                // tracing::debug!(
+                                //     "Order update raw: data_len={}, data_hex={:02x?}",
+                                //     msg_data.len(),
+                                //     &msg_data[..msg_data.len().min(32)]
+                                // );
 
                                 // 解析所有订单更新（一条消息可能包含多个）
                                 let updates = OrderUpdate::parse_all(&msg_data);
@@ -377,17 +413,21 @@ impl Mt4Client {
                                     );
                                 } else {
                                     tracing::debug!("Parsed {} order update(s) from {} bytes", updates.len(), msg_data.len());
-                                    for update in updates {
-                                        tracing::info!(
-                                            "Order update: ticket={}, symbol={}, type={:?}, notify_type={}, close_time={}",
-                                            update.order.ticket,
-                                            update.order.symbol,
-                                            update.order.order_type,
-                                            update.notify_type,
-                                            update.order.close_time
-                                        );
-                                        let _ = event_tx.send(Mt4Event::OrderUpdate(update)).await;
+                                    for update in &updates {
+                                        // tracing::info!(
+                                        //     "Order update: ticket={}, symbol={}, type={:?}, notify_type={}, close_time={}, comment={}",
+                                        //     update.order.ticket,
+                                        //     update.order.symbol,
+                                        //     update.order.order_type,
+                                        //     update.notify_type,
+                                        //     update.order.close_time,
+                                        //     update.order.comment
+                                        // );
+                                        tracing::info!("update.order 详情: {:?}", update.order);
+
                                     }
+                                    // 批量发送订单更新事件，让接收方可以一次性处理所有更新后再做决策 
+                                    let _ = event_tx.send(Mt4Event::OrderUpdates(updates)).await;
                                 }
                             }
                             12 => {
@@ -727,24 +767,19 @@ impl Mt4Client {
 
     /// 判断订单是否已平仓
     ///
-    /// 注意：历史订单中 close_time 字段可能未填充（为0），
-    /// 所以我们用 close_price 来判断：
-    /// - 如果 close_price > 0 且 != open_price，认为已平仓
-    /// - 或者如果有明确的 close_time > 0，也认为已平仓
+    /// 判断逻辑:
+    /// 1. close_time > 0 表示已平仓 (最可靠)
+    /// 2. close_price > 0 且 != open_price 表示已平仓 (备用)
     fn is_order_closed(order: &Order) -> bool {
         // 方法1: 有明确的平仓时间
         if order.close_time > 0 {
             return true;
         }
 
-        // 方法2: close_price 有意义且不等于开仓价
-        // （允许一定的浮点误差）
+        // 方法2: close_price 有意义且不等于开仓价 (允许浮点误差)
         if order.close_price > 0.0 && (order.close_price - order.open_price).abs() > 0.00001 {
             return true;
         }
-
-        // 方法3: 如果 profit 不为 0，可能是已平仓订单
-        // 但这个判断不够可靠，因为持仓订单也有浮动盈亏
 
         false
     }

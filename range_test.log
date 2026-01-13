@@ -1,0 +1,16 @@
+==================================================
+MT4 Rust Client 测试
+==================================================
+账号: 31313724
+服务器: ICMarketsSC-Demo03
+==================================================
+订单日志: orders.log
+
+[1] 正在连接...
+[2m2025-12-29T10:01:14.727536Z[0m [32m INFO[0m [2mmt4_client::client[0m[2m:[0m Connecting to MT4: login=31313724, server=ICMarketsSC-Demo03
+[2m2025-12-29T10:01:15.474809Z[0m [32m INFO[0m [2mmt4_client::api[0m[2m:[0m Token received, signal_server: gwt4.mql5.com:443
+[2m2025-12-29T10:01:15.475566Z[0m [32m INFO[0m [2mmt4_client::client[0m[2m:[0m Token received: gbr9yx2UjcErpZmfAvhw
+[2m2025-12-29T10:01:15.477109Z[0m [32m INFO[0m [2mmt4_client::client[0m[2m:[0m Connecting to WebSocket: wss://gwt4.mql5.com/
+[1] 连接成功，等待认证...
+[2m2025-12-29T10:01:16.926474Z[0m [32m INFO[0m [2mmt4_client::client[0m[2m:[0m Received: command=0, error=0, data_len=2
+[2m2025-12-29T10:01:16.928662Z[0m [32m INFO[0m [2mmt4_client::client[0m[2m:[0m Token accepted, sending password...

@@ -82,7 +82,7 @@ impl Command {
 }
 
 /// 订单类型 (cmd)
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[repr(i32)]
 pub enum OrderType {
     Buy = 0,

@@ -551,7 +551,7 @@ cd mt4-rust
 cargo run --example trade_test -- <login> <password> <server>
 
 # 示例
-cargo run --example trade_test -- 31313724 password ICMarketsSC-Demo03
+cargo run --example trade_test -- 31313724 ufrt32 ICMarketsSC-Demo03
 ```
 
 **功能特性**:

@@ -5,7 +5,7 @@ use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use std::io::Cursor;
 
 /// 订单信息
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Order {
     /// 订单号
     pub ticket: i32,
@@ -42,112 +42,124 @@ pub struct Order {
 impl Order {
     /// 从字节数据解析订单 (161字节)
     ///
-    /// Order 数据结构 (161 bytes) - 根据 mt4.en.js 分析:
-    /// - 0-3:     ticket (i32)
-    /// - 4-15:    symbol (12 bytes ASCII)
-    /// - 16-19:   digits (i32)
-    /// - 20-23:   cmd/order_type (i32)
-    /// - 24-27:   volume (i32, raw / 10000)
-    /// - 28-31:   unknown1 (i32)
-    /// - 32-35:   unknown2 (i32)
-    /// - 36-43:   open_price (f64)
-    /// - 44-51:   sl (f64)
-    /// - 52-59:   tp (f64)
-    /// - 60-63:   unknown3 (i32)
-    /// - 64-67:   open_time (i32, seconds)
-    /// - 68:      unknown4 (i8)
-    /// - 69-76:   commission (f64)
-    /// - 77-84:   unknown5 (f64)
-    /// - 85-92:   swap (f64)
-    /// - 93-100:  profit (f64)
-    /// - 101-108: unknown6 (f64)
-    /// - 109-116: unknown7 (f64)
-    /// - 117-120: unknown8 (i32)
-    /// - 121-152: comment (32 bytes UTF-8)
-    /// - 153-160: close_price (f64)
+    /// Order 数据结构 (161 bytes) - 修正后的实际结构:
+    /// - 0-3:     ticket (i32)           - c.R
+    /// - 4-15:    symbol (12 bytes)      - c.J (Yb)
+    /// - 16-19:   digits (i32)           - c.P
+    /// - 20-23:   order_type (i32)       - c.D
+    /// - 24-27:   volume*100 (i32)       - c.ua
+    /// - 28-31:   ⚠️ open_time (i32, sec)  - c.zo (原标注为 unknown1，实际是开仓时间!)
+    /// - 32-35:   unknown2 (i32)         - c.ZH
+    /// - 36-43:   open_price (f64)       - c.Ra
+    /// - 44-51:   sl (f64)               - c.Aa
+    /// - 52-59:   tp (f64)               - c.Ba
+    /// - 60-63:   ⚠️ close_time (i32, sec) - c.Si (原标注为 unknown3，实际是平仓时间!)
+    /// - 64-67:   unknown_time (i32)     - c.Bc (JS中*1000，但历史订单中为0，可能是订单创建时间)
+    /// - 68:      unknown4 (i8)          - c.sY
+    /// - 69-76:   unknown5 (f64)         - c.Il
+    /// - 77-84:   unknown6 (f64)         - c.HX
+    /// - 85-92:   unknown7 (f64)         - c.im
+    /// - 93-100:  close_price (f64)      - c.Tc
+    /// - 101-108: profit (f64)           - c.Uc
+    /// - 109-116: swap (f64)             - c.mm
+    /// - 117-120: unknown8 (i32)         - c.ZX (历史订单中为0，不是close_time)
+    /// - 121-152: comment (32 bytes)     - c.vc (xg)
+    /// - 153-160: commission (f64)       - c.wo
     pub fn from_bytes(data: &[u8], offset: usize) -> Option<Self> {
         if data.len() < offset + 161 {
             return None;
         }
 
-        // 使用直接字节读取而不是 cursor，以便精确控制偏移
         let base = offset;
 
+        // 0-3: ticket (i32)
         let ticket = i32::from_le_bytes([
             data[base], data[base+1], data[base+2], data[base+3]
         ]);
 
-        // 读取 symbol (12字节 ASCII)
+        // 4-15: symbol (12字节)
         let symbol_bytes = &data[base+4..base+16];
         let symbol = String::from_utf8_lossy(symbol_bytes)
             .trim_end_matches('\0')
             .to_string();
 
+        // 16-19: digits (i32)
         let digits = i32::from_le_bytes([
             data[base+16], data[base+17], data[base+18], data[base+19]
         ]);
 
+        // 20-23: order_type (i32)
         let cmd = i32::from_le_bytes([
             data[base+20], data[base+21], data[base+22], data[base+23]
         ]);
 
+        // 24-27: volume*100 (i32)
         let volume_raw = i32::from_le_bytes([
             data[base+24], data[base+25], data[base+26], data[base+27]
         ]);
 
-        // 跳过 unknown1 (28-31) 和 unknown2 (32-35)
+        // 28-31: open_time (i32, Unix时间戳秒) - 修正：不是 unknown，是真实的开仓时间
+        let open_time = i32::from_le_bytes([
+            data[base+28], data[base+29], data[base+30], data[base+31]
+        ]) as i64;
 
+        // 36-43: open_price (f64)
         let open_price = f64::from_le_bytes([
             data[base+36], data[base+37], data[base+38], data[base+39],
             data[base+40], data[base+41], data[base+42], data[base+43],
         ]);
 
+        // 44-51: sl (f64)
         let sl = f64::from_le_bytes([
             data[base+44], data[base+45], data[base+46], data[base+47],
             data[base+48], data[base+49], data[base+50], data[base+51],
         ]);
 
+        // 52-59: tp (f64)
         let tp = f64::from_le_bytes([
             data[base+52], data[base+53], data[base+54], data[base+55],
             data[base+56], data[base+57], data[base+58], data[base+59],
         ]);
 
-        // open_time: 开仓时间 (Unix时间戳，秒)
-        // JavaScript中使用 c.zo = f.getInt32(k+28, !0)
-        let open_time = i32::from_le_bytes([
-            data[base+28], data[base+29], data[base+30], data[base+31]
+        // 60-63: close_time (i32, Unix时间戳秒) - 修正：这才是真实的平仓时间
+        let close_time = i32::from_le_bytes([
+            data[base+60], data[base+61], data[base+62], data[base+63]
         ]) as i64;
 
-        // 跳过 unknown3 (32-35, 60-67)
+        // 64-67: 未知时间字段 (历史订单中为0，实时订单可能有值)
+        // 不再用于 open_time，因为真正的 open_time 在 offset 28-31
 
-        // 跳过 unknown4 (68)
-
-        let commission = f64::from_le_bytes([
-            data[base+69], data[base+70], data[base+71], data[base+72],
-            data[base+73], data[base+74], data[base+75], data[base+76],
-        ]);
-
-        // 跳过 unknown5 (77-84)
-
-        let swap = f64::from_le_bytes([
-            data[base+85], data[base+86], data[base+87], data[base+88],
-            data[base+89], data[base+90], data[base+91], data[base+92],
-        ]);
-
-        let profit = f64::from_le_bytes([
+        // 93-100: close_price (f64)
+        let close_price = f64::from_le_bytes([
             data[base+93], data[base+94], data[base+95], data[base+96],
             data[base+97], data[base+98], data[base+99], data[base+100],
         ]);
 
-        // 跳过 unknown6 (101-108), unknown7 (109-116), unknown8 (117-120)
+        // 101-108: profit (f64)
+        let profit = f64::from_le_bytes([
+            data[base+101], data[base+102], data[base+103], data[base+104],
+            data[base+105], data[base+106], data[base+107], data[base+108],
+        ]);
 
-        // comment (121-152, 32 bytes UTF-8)
+        // 109-116: swap (f64)
+        let swap = f64::from_le_bytes([
+            data[base+109], data[base+110], data[base+111], data[base+112],
+            data[base+113], data[base+114], data[base+115], data[base+116],
+        ]);
+
+        // 117-120: 未知字段 (JS中为c.ZX，用途不明)
+        // let _unknown = i32::from_le_bytes([
+        //     data[base+117], data[base+118], data[base+119], data[base+120]
+        // ]);
+
+        // 121-152: comment (32 bytes)
         let comment_bytes = &data[base+121..base+153];
         let comment = String::from_utf8_lossy(comment_bytes)
             .trim_end_matches('\0')
             .to_string();
 
-        let close_price = f64::from_le_bytes([
+        // 153-160: commission (f64)
+        let commission = f64::from_le_bytes([
             data[base+153], data[base+154], data[base+155], data[base+156],
             data[base+157], data[base+158], data[base+159], data[base+160],
         ]);
@@ -157,12 +169,12 @@ impl Order {
             symbol,
             digits,
             order_type: OrderType::from_i32(cmd).unwrap_or(OrderType::Buy),
-            volume: volume_raw as f64 / 10000.0,  // 正确的除数
+            volume: volume_raw as f64 / 100.0,  // JS: (b.ua/100)
             open_time,
             open_price,
             sl,
             tp,
-            close_time: 0,  // close_time 不在这个结构中
+            close_time,
             close_price,
             commission,
             swap,
@@ -171,7 +183,7 @@ impl Order {
         })
     }
 
-    /// 是否为持仓订单
+    /// 是否为持仓订单 (close_time == 0 表示未平仓)
     pub fn is_open(&self) -> bool {
         self.close_time == 0
     }
@@ -645,135 +657,88 @@ impl TradeResponse {
 }
 
 /// 订单更新事件
+///
+/// 数据包固定大小: 185 字节
+/// 按照 JS 实现方式，直接以 185 字节为步长分割数据包
+/// Close By 操作会被解析为两个独立的 OrderUpdate（而不是一个包含 related_order 的更新）
 #[derive(Debug, Clone)]
 pub struct OrderUpdate {
     /// 通知ID
     pub notify_id: i32,
-    /// 通知类型 (0=新订单, 1=已平仓, 2=订单修改, 3=账户更新)
+    /// 通知类型:
+    ///   0 = 新订单（开仓/挂单成交）
+    ///   1 = 已平仓（订单关闭）
+    ///   2 = 订单修改（价格更新、SL/TP修改等）
+    ///   3 = 账户更新
     pub notify_type: i32,
     /// 账户余额相关数据 (对应 JS 中的 df 字段，用于更新账户信息)
     pub df: f64,
     /// 账户信用相关数据 (对应 JS 中的 xh 字段，用于更新账户信息)
     pub xh: f64,
-    /// 数据包原始大小
+    /// 数据包原始大小（固定为 185）
     pub raw_size: usize,
     /// 订单信息
     pub order: Order,
-    /// 关联订单 (close by 时的对冲订单)
+    /// 关联订单 (保留字段，但始终为 None，因为采用了 JS 的简单分割方式)
     pub related_order: Option<Order>,
 }
 
 impl OrderUpdate {
-    /// 从字节数据解析
+    /// 从字节数据解析（从指定偏移量）
     ///
-    /// 数据包格式:
-    /// - 185 字节: 标准订单更新 (24字节头 + 161字节订单)
+    /// 数据包格式 (185 字节固定大小):
     ///   - 0-3: notify_id (4字节)
     ///   - 4-7: notify_type (4字节)
     ///   - 8-15: df (8字节 f64) - 账户余额相关数据
     ///   - 16-23: xh (8字节 f64) - 账户信用相关数据
     ///   - 24-184: Order数据 (161字节)
-    /// - 370 字节: Close By 平仓 (24字节头 + 161字节订单1 + 185字节订单2更新)
-    pub fn from_bytes(data: &[u8]) -> Option<Self> {
-        let raw_size = data.len();
-
-        // 至少需要 24 字节头（包含 notify_id, notify_type, df, xh）
-        if raw_size < 24 {
+    ///
+    /// 参数:
+    /// - data: 完整数据包
+    /// - offset: 从哪个位置开始解析
+    pub fn from_bytes(data: &[u8], offset: usize) -> Option<Self> {
+        // 确保有足够的数据（185 字节）
+        if offset + 185 > data.len() {
             return None;
         }
 
-        let mut cursor = Cursor::new(data);
+        let slice = &data[offset..offset + 185];
+        let mut cursor = Cursor::new(slice);
+
         let notify_id = cursor.read_i32::<LittleEndian>().ok()?;
         let notify_type = cursor.read_i32::<LittleEndian>().ok()?;
         let df = cursor.read_f64::<LittleEndian>().ok()?;
         let xh = cursor.read_f64::<LittleEndian>().ok()?;
 
-        // 370 字节: Close By 平仓 (包含两个订单)
-        // 格式: 24字节头 + 161字节(被平仓订单) + 185字节(对冲订单完整更新)
-        if raw_size >= 370 {
-            let order = Order::from_bytes(data, 24)?;
-            // 第二个订单从偏移 24 + 161 = 185 开始
-            // 但第二个订单是完整的 OrderUpdate 格式（185字节），订单数据从其偏移24开始
-            // 所以实际订单数据在: 24 + 161 + 24 = 209
-            let related_order = Order::from_bytes(data, 24 + 161 + 24);
+        // 从偏移 24 开始解析订单数据（161字节）
+        let order = Order::from_bytes(slice, 24)?;
 
-            return Some(OrderUpdate {
-                notify_id,
-                notify_type,
-                df,
-                xh,
-                raw_size,
-                order,
-                related_order,
-            });
-        }
-
-        // 185 字节: 标准订单更新
-        if raw_size >= 185 {
-            if let Some(order) = Order::from_bytes(data, 24) {
-                return Some(OrderUpdate {
-                    notify_id,
-                    notify_type,
-                    df,
-                    xh,
-                    raw_size,
-                    order,
-                    related_order: None,
-                });
-            }
-        }
-
-        // 尝试从偏移8解析订单 (紧凑格式 - 向后兼容)
-        if raw_size >= 8 + 161 {
-            if let Some(order) = Order::from_bytes(data, 8) {
-                return Some(OrderUpdate {
-                    notify_id,
-                    notify_type,
-                    df: 0.0,
-                    xh: 0.0,
-                    raw_size,
-                    order,
-                    related_order: None,
-                });
-            }
-        }
-
-        None
+        Some(OrderUpdate {
+            notify_id,
+            notify_type,
+            df,
+            xh,
+            raw_size: 185,
+            order,
+            related_order: None,
+        })
     }
 
     /// 从数据中解析所有订单更新（一条消息可能包含多个订单更新）
+    ///
+    /// 按照 JS 实现方式：直接按 185 字节固定步长分割
+    /// 对应 JS 代码: Math.floor(byteLength/185) 然后循环解析
     pub fn parse_all(data: &[u8]) -> Vec<OrderUpdate> {
         let mut results = Vec::new();
-        let mut offset = 0;
-        let total_len = data.len();
 
-        while offset < total_len {
-            let remaining = &data[offset..];
-            let remaining_len = remaining.len();
+        // 计算订单数量: byteLength / 185
+        let count = data.len() / 185;
 
-            if remaining_len < 185 {
-                // 不足以解析一个完整的订单更新
-                break;
-            }
-
-            // 尝试解析一个 OrderUpdate
-            if let Some(update) = Self::from_bytes(remaining) {
-                let consumed = if update.raw_size >= 370 {
-                    // Close By 格式：370 字节（包含两个订单）
-                    370
-                } else if update.raw_size >= 185 {
-                    // 标准格式：185 字节
-                    185
-                } else {
-                    // 紧凑格式：实际大小
-                    update.raw_size as usize
-                };
-
+        // 按照固定步长 185 字节循环解析
+        for i in 0..count {
+            let offset = i * 185;
+            if let Some(update) = Self::from_bytes(data, offset) {
                 results.push(update);
-                offset += consumed;
-            } else {
-                // 解析失败，尝试跳过 185 字节继续
-                offset += 185;
             }
         }
 
@@ -781,13 +746,17 @@ impl OrderUpdate {
     }
 
     /// 是否为平仓通知
+    /// 注意：close_time 不可靠（测试发现始终为0），只能依赖 notify_type
     pub fn is_close_notification(&self) -> bool {
-        self.order.close_time > 0
+        self.notify_type == 1
     }
 
     /// 是否为 Close By 操作 (对冲平仓)
+    ///
+    /// 注意：由于采用 JS 的简单分割方式，Close By 操作会被解析为两个独立的 OrderUpdate
+    /// 因此此方法总是返回 false，related_order 字段也始终为 None
     pub fn is_close_by(&self) -> bool {
-        self.raw_size >= 370 && self.related_order.is_some()
+        false
     }
 
     /// 获取实际的平仓价格
