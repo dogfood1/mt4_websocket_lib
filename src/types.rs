@@ -225,6 +225,9 @@ pub struct TradeRequest {
     pub comment: String,
     /// 过期时间
     pub expiration: i32,
+    /// 请求ID (本地生成，用于匹配响应)
+    /// 根据 JS mt4.en.js 第1183行: b.kj = B.GH++ (从1000开始递增)
+    pub request_id: i32,
 }
 
 impl TradeRequest {
@@ -242,6 +245,7 @@ impl TradeRequest {
             slippage: 50,
             comment: String::new(),
             expiration: 0,
+            request_id: 0, // 由客户端在发送时设置
         }
     }
 
@@ -259,6 +263,7 @@ impl TradeRequest {
             slippage: 50,
             comment: String::new(),
             expiration: 0,
+            request_id: 0,
         }
     }
 
@@ -276,6 +281,7 @@ impl TradeRequest {
             slippage: 50,
             comment: String::new(),
             expiration: 0,
+            request_id: 0,
         }
     }
 
@@ -293,6 +299,7 @@ impl TradeRequest {
             slippage: 50,
             comment: String::new(),
             expiration: 0,
+            request_id: 0,
         }
     }
 
@@ -310,6 +317,7 @@ impl TradeRequest {
             slippage: 50,
             comment: String::new(),
             expiration: 0,
+            request_id: 0,
         }
     }
 
@@ -327,10 +335,26 @@ impl TradeRequest {
             slippage: 0,
             comment: String::new(),
             expiration: 0,
+            request_id: 0,
         }
     }
 
     /// 序列化为字节数组 (95字节)
+    ///
+    /// 根据 JS mt4.en.js 第1104行 q.pG 函数:
+    /// - offset 0:  type (1 byte)
+    /// - offset 1:  cmd (2 bytes)
+    /// - offset 3:  ticket (4 bytes)
+    /// - offset 7:  unknown (4 bytes)
+    /// - offset 11: symbol (12 bytes ASCII)
+    /// - offset 23: volume*100 (4 bytes)
+    /// - offset 27: price (8 bytes)
+    /// - offset 35: sl (8 bytes)
+    /// - offset 43: tp (8 bytes)
+    /// - offset 51: slippage (4 bytes)
+    /// - offset 55: comment (32 bytes UTF-8)
+    /// - offset 87: expiration (4 bytes)
+    /// - offset 91: request_id (4 bytes) ← 关键! JS: g.kj
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut buffer = vec![0u8; 95];
         let mut cursor = Cursor::new(&mut buffer[..]);
@@ -379,12 +403,13 @@ impl TradeRequest {
         let len = comment_bytes.len().min(32);
         buffer[55..55 + len].copy_from_slice(&comment_bytes[..len]);
 
-        // expiration (4 bytes)
+        // expiration (4 bytes) - offset 87
         let mut cursor = Cursor::new(&mut buffer[87..]);
         cursor.write_i32::<LittleEndian>(self.expiration).unwrap();
 
-        // unknown (4 bytes)
-        cursor.write_i32::<LittleEndian>(0).unwrap();
+        // request_id (4 bytes) - offset 91
+        // 根据 JS mt4.en.js 第1104行: c.setInt32(91, g.kj, !0)
+        cursor.write_i32::<LittleEndian>(self.request_id).unwrap();
 
         buffer
     }

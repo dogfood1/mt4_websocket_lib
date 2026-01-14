@@ -8,10 +8,180 @@ use crate::types::{AccountInfo, Order, OrderUpdate, TradeRequest};
 use crate::LoginCredentials;
 use byteorder::{LittleEndian, WriteBytesExt};
 use futures_util::{SinkExt, StreamExt};
+use std::collections::HashMap;
 use std::io::Cursor;
+use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::Arc;
-use tokio::sync::{mpsc, Mutex};
+use std::time::Instant;
+use tokio::sync::{mpsc, Mutex, RwLock};
 use tokio_tungstenite::{connect_async, tungstenite::Message};
+
+/// 待确认的交易请求
+/// 根据 JS mt4.en.js 第1183行: N[b.kj] = b (待确认请求映射)
+#[derive(Debug, Clone)]
+pub struct PendingRequest {
+    /// 请求ID
+    pub request_id: i32,
+    /// 原始请求
+    pub request: TradeRequest,
+    /// 创建时间
+    pub created_at: Instant,
+    /// 目标ticket (平仓/取消/修改操作时有值)
+    pub target_ticket: Option<i32>,
+}
+
+/// 请求追踪器
+/// 根据 JS mt4.en.js 第1216行初始化:
+/// - N = {}  待确认请求
+/// - W = {}  超时定时器
+/// - E = {}  ticket防重复
+/// - B.GH = 1000  request_id计数器
+#[derive(Debug)]
+pub struct RequestTracker {
+    /// request_id 计数器 (从1000开始，与JS一致)
+    next_request_id: AtomicI32,
+    /// 待确认请求: request_id -> PendingRequest
+    /// 对应 JS 的 N[]
+    pending_requests: RwLock<HashMap<i32, PendingRequest>>,
+    /// ticket 防重复: ticket -> request_id
+    /// 对应 JS 的 E[]
+    /// 防止同一个ticket同时有多个操作
+    ticket_locks: RwLock<HashMap<i32, i32>>,
+}
+
+impl Default for RequestTracker {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl RequestTracker {
+    /// 创建新的请求追踪器
+    pub fn new() -> Self {
+        Self {
+            // 根据 JS: B.GH = 1000
+            next_request_id: AtomicI32::new(1000),
+            pending_requests: RwLock::new(HashMap::new()),
+            ticket_locks: RwLock::new(HashMap::new()),
+        }
+    }
+
+    /// 生成下一个 request_id
+    /// 对应 JS: b.kj = B.GH++
+    pub fn next_id(&self) -> i32 {
+        self.next_request_id.fetch_add(1, Ordering::SeqCst)
+    }
+
+    /// 检查ticket是否已被锁定(防止重复操作)
+    /// 对应 JS: if (E && E[b.R]) return;
+    pub async fn is_ticket_locked(&self, ticket: i32) -> bool {
+        let locks = self.ticket_locks.read().await;
+        locks.contains_key(&ticket)
+    }
+
+    /// 添加待确认请求
+    /// 对应 JS: E[b.R] = b.kj; N[b.kj] = b;
+    pub async fn add_pending(&self, request: TradeRequest) -> i32 {
+        let request_id = request.request_id;
+        let target_ticket = if request.ticket != 0 {
+            Some(request.ticket)
+        } else {
+            None
+        };
+
+        // 如果是针对特定ticket的操作，锁定该ticket
+        if let Some(ticket) = target_ticket {
+            let mut locks = self.ticket_locks.write().await;
+            locks.insert(ticket, request_id);
+        }
+
+        // 添加到待确认队列
+        let pending = PendingRequest {
+            request_id,
+            request,
+            created_at: Instant::now(),
+            target_ticket,
+        };
+
+        let mut pending_requests = self.pending_requests.write().await;
+        pending_requests.insert(request_id, pending);
+
+        request_id
+    }
+
+    /// 确认请求完成(收到响应后调用)
+    /// 对应 JS 第1212行:
+    /// - E[e.R] = null (清除ticket锁)
+    /// - clearTimeout(W[c.Xg]) (清除超时)
+    /// - N[c.Xg] = null (移除待确认)
+    pub async fn confirm(&self, request_id: i32) -> Option<PendingRequest> {
+        let mut pending_requests = self.pending_requests.write().await;
+        if let Some(pending) = pending_requests.remove(&request_id) {
+            // 清除ticket锁
+            if let Some(ticket) = pending.target_ticket {
+                let mut locks = self.ticket_locks.write().await;
+                // 只有当锁对应的request_id匹配时才清除
+                if locks.get(&ticket) == Some(&request_id) {
+                    locks.remove(&ticket);
+                }
+            }
+            Some(pending)
+        } else {
+            None
+        }
+    }
+
+    /// 获取超时的请求 (超过指定时间未确认)
+    /// 对应 JS 第1183行的超时处理: setTimeout(..., 180000)
+    pub async fn get_timed_out(&self, timeout_secs: u64) -> Vec<PendingRequest> {
+        let pending_requests = self.pending_requests.read().await;
+        let now = Instant::now();
+        pending_requests
+            .values()
+            .filter(|p| now.duration_since(p.created_at).as_secs() >= timeout_secs)
+            .cloned()
+            .collect()
+    }
+
+    /// 移除超时的请求并返回
+    pub async fn remove_timed_out(&self, timeout_secs: u64) -> Vec<PendingRequest> {
+        let mut pending_requests = self.pending_requests.write().await;
+        let mut locks = self.ticket_locks.write().await;
+        let now = Instant::now();
+
+        let timed_out: Vec<i32> = pending_requests
+            .iter()
+            .filter(|(_, p)| now.duration_since(p.created_at).as_secs() >= timeout_secs)
+            .map(|(id, _)| *id)
+            .collect();
+
+        let mut result = Vec::new();
+        for request_id in timed_out {
+            if let Some(pending) = pending_requests.remove(&request_id) {
+                // 清除ticket锁
+                if let Some(ticket) = pending.target_ticket {
+                    if locks.get(&ticket) == Some(&request_id) {
+                        locks.remove(&ticket);
+                    }
+                }
+                result.push(pending);
+            }
+        }
+        result
+    }
+
+    /// 获取所有待确认请求数量
+    pub async fn pending_count(&self) -> usize {
+        self.pending_requests.read().await.len()
+    }
+
+    /// 清空所有追踪状态 (断开连接时调用)
+    /// 对应 JS 第1216行的 B.hb() 函数
+    pub async fn clear(&self) {
+        self.pending_requests.write().await.clear();
+        self.ticket_locks.write().await.clear();
+    }
+}
 
 /// 客户端事件
 #[derive(Debug, Clone)]
@@ -39,6 +209,13 @@ pub enum Mt4Event {
     TradeSuccess { request_id: i32, status: i32 },
     /// 交易失败
     TradeFailed { code: u8, message: String },
+    /// 交易请求超时
+    /// 根据 JS mt4.en.js 第1183行: 180秒超时生成 status=128 (Trade timeout)
+    TradeTimeout {
+        request_id: i32,
+        request: TradeRequest,
+        elapsed_secs: f64,
+    },
     /// 连接断开
     Disconnected,
     /// 错误
@@ -63,6 +240,9 @@ pub struct Mt4Client {
     authenticated: bool,
     /// Token 信息
     token_info: Option<TokenResponse>,
+    /// 请求追踪器 (用于管理待确认请求、防重复、超时)
+    /// 根据 JS mt4.en.js 第1216行: N={}, W={}, E={}, B.GH=1000
+    request_tracker: Arc<RequestTracker>,
 }
 
 impl Mt4Client {
@@ -75,7 +255,13 @@ impl Mt4Client {
             event_rx: None,
             authenticated: false,
             token_info: None,
+            request_tracker: Arc::new(RequestTracker::new()),
         }
+    }
+
+    /// 获取请求追踪器的引用
+    pub fn request_tracker(&self) -> &Arc<RequestTracker> {
+        &self.request_tracker
     }
 
     /// 连接到 MT4 服务器
@@ -153,6 +339,8 @@ impl Mt4Client {
         let login_id: i32 = credentials.login.parse().unwrap_or(0);
         let token = token_info.token.clone();
         let write_tx_clone = write_tx.clone();
+        let request_tracker = self.request_tracker.clone();
+        let timeout_event_tx = event_tx.clone(); // 用于超时任务
 
         tokio::spawn(async move {
             let mut read = read;
@@ -303,16 +491,16 @@ impl Mt4Client {
                                     for i in 0..order_count {
                                         let offset = i * 161;
                                         if let Some(order) = Order::from_bytes(&msg_data, offset) {
-                                            tracing::info!(
-                                                "持仓 #{}: ticket={}, symbol={}, type={:?}, volume={:.2}, open={:.5}, profit={:.2}",
-                                                i,
-                                                order.ticket,
-                                                order.symbol,
-                                                order.order_type,
-                                                order.volume,
-                                                order.open_price,
-                                                order.profit
-                                            );
+                                            // tracing::info!(
+                                            //     "持仓 #{}: ticket={}, symbol={}, type={:?}, volume={:.2}, open={:.5}, profit={:.2}",
+                                            //     i,
+                                            //     order.ticket,
+                                            //     order.symbol,
+                                            //     order.order_type,
+                                            //     order.volume,
+                                            //     order.open_price,
+                                            //     order.profit
+                                            // );
                                             orders.push(order);
                                         }
                                     }
@@ -330,25 +518,25 @@ impl Mt4Client {
 
                                 // 输出 hex 数据以便分析
                                 if !msg_data.is_empty() {
-                                    // 输出前 200 字节
-                                    let hex_preview = msg_data.iter()
-                                        .take(200)
-                                        .map(|b| format!("{:02x}", b))
-                                        .collect::<Vec<_>>()
-                                        .join(" ");
-                                    tracing::info!("Command 5 data (first 200 bytes): {}", hex_preview);
+                                    // // 输出前 200 字节
+                                    // let hex_preview = msg_data.iter()
+                                    //     .take(200)
+                                    //     .map(|b| format!("{:02x}", b))
+                                    //     .collect::<Vec<_>>()
+                                    //     .join(" ");
+                                    // tracing::info!("Command 5 data (first 200 bytes): {}", hex_preview);
 
-                                    // 输出前 3 个 161 字节记录的完整 hex
-                                    for i in 0..3 {
-                                        let offset = i * 161;
-                                        if msg_data.len() >= offset + 161 {
-                                            let order_hex = msg_data[offset..offset+161].iter()
-                                                .map(|b| format!("{:02x}", b))
-                                                .collect::<Vec<_>>()
-                                                .join(" ");
-                                            tracing::info!("Record #{} (161 bytes): {}", i, order_hex);
-                                        }
-                                    }
+                                    // // 输出前 3 个 161 字节记录的完整 hex
+                                    // for i in 0..3 {
+                                    //     let offset = i * 161;
+                                    //     if msg_data.len() >= offset + 161 {
+                                    //         let order_hex = msg_data[offset..offset+161].iter()
+                                    //             .map(|b| format!("{:02x}", b))
+                                    //             .collect::<Vec<_>>()
+                                    //             .join(" ");
+                                    //         tracing::info!("Record #{} (161 bytes): {}", i, order_hex);
+                                    //     }
+                                    // }
 
                                     // 解析订单（命令 5 = 历史订单）
                                     // 根据 mt4.en.js line 1103 的 Sr() 函数:
@@ -360,30 +548,13 @@ impl Mt4Client {
                                     for i in 0..order_count {
                                         let offset = i * 161;
                                         if let Some(order) = Order::from_bytes(&msg_data, offset) {
-                                            tracing::info!(
-                                                "历史订单 #{}: ticket={}, symbol={}, type={:?}, volume={:.2}, open={:.5}, close={:.5}, profit={:.2}, open_time={}, close_time={}",
-                                                i, order.ticket, order.symbol, order.order_type, order.volume,
-                                                order.open_price, order.close_price, order.profit,
-                                                order.open_time, order.close_time
-                                            );
+                                            // tracing::info!(
+                                            //     "历史订单 #{}: ticket={}, symbol={}, type={:?}, volume={:.2}, open={:.5}, close={:.5}, profit={:.2}, open_time={}, close_time={}",
+                                            //     i, order.ticket, order.symbol, order.order_type, order.volume,
+                                            //     order.open_price, order.close_price, order.profit,
+                                            //     order.open_time, order.close_time
+                                            // );
 
-                                            // 调试：验证修正后的时间戳解析
-                                            if i == 0 {
-                                                let ticket_bytes = &msg_data[offset..offset+4];
-                                                let open_time_bytes_new = &msg_data[offset+28..offset+32]; // 修正：offset 28-31
-                                                let close_time_bytes = &msg_data[offset+60..offset+64];
-
-                                                tracing::info!(
-                                                    "📋 [历史订单 #{}] ticket={} 时间戳验证 (修正后):\n  \
-                                                     Ticket: {:02x?}\n  \
-                                                     ✅ Open Time (offset 28-31): {:02x?} → 解析: {}\n  \
-                                                     ✅ Close Time (offset 60-63): {:02x?} → 解析: {}",
-                                                    i, order.ticket,
-                                                    ticket_bytes,
-                                                    open_time_bytes_new, order.open_time,
-                                                    close_time_bytes, order.close_time
-                                                );
-                                            }
 
                                             history_orders.push(order);
                                         }
@@ -432,37 +603,66 @@ impl Mt4Client {
                             }
                             12 => {
                                 // 交易响应 - 解析完整的响应数据
+                                // 根据 JS mt4.en.js 第1211行的 d 函数处理响应
                                 if let Some(response) = crate::types::TradeResponse::from_bytes(&msg_data) {
-                                    // 检查 error_code 或 status 是否有错误
-                                    // status=0: Success, status=1: Request sent (都是成功)
-                                    // status>=2: 各种错误
+                                    let request_id = response.request_id;
+
+                                    // 详细日志：显示 error_code 和 response.status 的值
+                                    tracing::debug!(
+                                        "Trade response: request_id={}, error_code={}, response.status={}, price1={:.5}, price2={:.5}",
+                                        request_id, error_code, response.status, response.price1, response.price2
+                                    );
+
+                                    // 确认请求完成 (对应 JS: clearTimeout(W[c.Xg]); N[c.Xg]=null; E[e.R]=null;)
+                                    if let Some(pending) = request_tracker.confirm(request_id).await {
+                                        tracing::info!(
+                                            "📥 [响应确认] request_id={}, 耗时={:.2}秒, target_ticket={:?}",
+                                            request_id,
+                                            pending.created_at.elapsed().as_secs_f64(),
+                                            pending.target_ticket
+                                        );
+                                    } else {
+                                        tracing::warn!(
+                                            "⚠️ [响应未匹配] request_id={} 未在待确认队列中找到",
+                                            request_id
+                                        );
+                                    }
+
+                                    // 根据JS原始逻辑:
+                                    // - error_code > 0 只是通讯层警告,仍需检查response.status
+                                    // - response.status >= 2 才是真正的交易错误
+                                    // - response.status 0=Success, 1=Request sent (都表示成功/待确认)
+
+                                    // 先记录通讯层警告(如果有)
                                     if error_code != 0 {
                                         let err = Mt4Error::from_trade_code(error_code);
-                                        if let Mt4Error::Trade { code, message } = err {
+                                        if let Mt4Error::Trade { code: _, message } = err {
                                             tracing::warn!(
-                                                "Trade failed (error_code): request_id={}, code={}, msg={}",
-                                                response.request_id, code, message
+                                                "Trade response with header error_code (warning only): request_id={}, error_code={}, response.status={}, msg={}",
+                                                request_id, error_code, response.status, message
                                             );
-                                            let _ = event_tx.send(Mt4Event::TradeFailed { code, message }).await;
                                         }
-                                    } else if response.status >= 2 {
+                                    }
+
+                                    // 根据response.status判断交易结果
+                                    if response.status >= 2 {
                                         // status >= 2 才是真正的错误
                                         let err = Mt4Error::from_trade_code(response.status as u8);
                                         if let Mt4Error::Trade { code, message } = err {
                                             tracing::warn!(
-                                                "Trade failed (status): request_id={}, code={}, msg={}",
-                                                response.request_id, code, message
+                                                "Trade failed (status>=2): request_id={}, error_code={}, response.status={}, code={}, msg={}",
+                                                request_id, error_code, response.status, code, message
                                             );
                                             let _ = event_tx.send(Mt4Event::TradeFailed { code, message }).await;
                                         }
                                     } else {
-                                        // status=0 (Success) 或 status=1 (Request sent) 都是成功
+                                        // status=0 (Success) 或 status=1 (Request sent) 都是成功/待确认
                                         tracing::info!(
-                                            "Trade success: request_id={}, status={}, price1={:.5}, price2={:.5}, orders_count={}",
-                                            response.request_id, response.status, response.price1, response.price2, response.orders.len()
+                                            "Trade success (status=0 or 1): request_id={}, error_code={}, response.status={}, price1={:.5}, price2={:.5}, orders_count={}",
+                                            request_id, error_code, response.status, response.price1, response.price2, response.orders.len()
                                         );
                                         let _ = event_tx.send(Mt4Event::TradeSuccess {
-                                            request_id: response.request_id,
+                                            request_id,
                                             status: response.status
                                         }).await;
                                     }
@@ -480,16 +680,23 @@ impl Mt4Client {
                                         0
                                     };
 
+                                    // 确认请求完成
+                                    if request_id != 0 {
+                                        request_tracker.confirm(request_id).await;
+                                    }
+
+                                    // 根据JS原始逻辑: error_code只是警告,status>=2才是错误
                                     if error_code != 0 {
                                         let err = Mt4Error::from_trade_code(error_code);
-                                        if let Mt4Error::Trade { code, message } = err {
-                                            tracing::warn!("Trade failed (error_code): code={}, msg={}", code, message);
-                                            let _ = event_tx.send(Mt4Event::TradeFailed { code, message }).await;
+                                        if let Mt4Error::Trade { code: _, message } = err {
+                                            tracing::warn!("Trade response with header error_code (warning only): error_code={}, msg={}", error_code, message);
                                         }
-                                    } else if status >= 2 {
+                                    }
+
+                                    if status >= 2 {
                                         let err = Mt4Error::from_trade_code(status as u8);
                                         if let Mt4Error::Trade { code, message } = err {
-                                            tracing::warn!("Trade failed (status): code={}, msg={}", code, message);
+                                            tracing::warn!("Trade failed (status>=2): code={}, msg={}", code, message);
                                             let _ = event_tx.send(Mt4Event::TradeFailed { code, message }).await;
                                         }
                                     } else {
@@ -536,6 +743,50 @@ impl Mt4Client {
         if let Some(writer) = &self.writer {
             writer.send(packet).await.map_err(|_| Mt4Error::Connection("Send failed".to_string()))?;
         }
+
+        // 9. 启动超时检测任务
+        // 根据 JS mt4.en.js 第1183行: setTimeout(..., 180000) - 180秒超时
+        let timeout_tracker = self.request_tracker.clone();
+        tokio::spawn(async move {
+            const TIMEOUT_SECS: u64 = 180; // 与 JS 一致
+            const CHECK_INTERVAL_SECS: u64 = 5; // 每5秒检查一次
+
+            let mut interval = tokio::time::interval(
+                tokio::time::Duration::from_secs(CHECK_INTERVAL_SECS)
+            );
+
+            loop {
+                interval.tick().await;
+
+                // 获取超时的请求
+                let timed_out = timeout_tracker.remove_timed_out(TIMEOUT_SECS).await;
+
+                for pending in timed_out {
+                    tracing::warn!(
+                        "⏰ [请求超时] request_id={}, 等待时间={:.1}秒, symbol={}, ticket={}, 超过{}秒未响应",
+                        pending.request_id,
+                        pending.created_at.elapsed().as_secs_f64(),
+                        pending.request.symbol,
+                        pending.request.ticket,
+                        TIMEOUT_SECS
+                    );
+
+                    // 发送超时事件
+                    // 对应 JS: c.Yg = z.dn (status=128, Trade timeout)
+                    let _ = timeout_event_tx.send(Mt4Event::TradeTimeout {
+                        request_id: pending.request_id,
+                        request: pending.request.clone(),
+                        elapsed_secs: pending.created_at.elapsed().as_secs_f64(),
+                    }).await;
+
+                    // 同时发送 TradeFailed 事件 (与 JS 行为一致)
+                    let _ = timeout_event_tx.send(Mt4Event::TradeFailed {
+                        code: 128, // Trade timeout
+                        message: "Trade timeout".to_string(),
+                    }).await;
+                }
+            }
+        });
 
         Ok(())
     }
@@ -606,29 +857,87 @@ impl Mt4Client {
         Ok(())
     }
 
-    /// 发送交易请求
-    pub async fn send_trade(&self, request: TradeRequest) -> Result<()> {
+    /// 发送交易请求 (内部方法，不使用追踪)
+    async fn send_trade_internal(&self, request: &TradeRequest) -> Result<()> {
+        let data = request.to_bytes();
+        self.send_command(Command::TradeRequest, &data).await
+    }
+
+    /// 发送交易请求 (带追踪)
+    /// 根据 JS mt4.en.js 第1183行的 J 函数:
+    /// 1. 生成 request_id
+    /// 2. 检查 ticket 防重复 (如果是针对特定ticket的操作)
+    /// 3. 添加到待确认队列
+    /// 4. 发送请求
+    ///
+    /// 返回 (request_id, is_duplicate)
+    /// - request_id: 分配的请求ID
+    /// - is_duplicate: 如果是重复操作则返回true (不发送)
+    pub async fn send_trade(&self, mut request: TradeRequest) -> Result<(i32, bool)> {
+        // 1. 生成 request_id (对应 JS: b.kj = B.GH++)
+        let request_id = self.request_tracker.next_id();
+        request.request_id = request_id;
+
+        // 2. 检查 ticket 防重复 (对应 JS: if (E && E[b.R]) return;)
+        if request.ticket != 0 {
+            if self.request_tracker.is_ticket_locked(request.ticket).await {
+                tracing::warn!(
+                    "⚠️ [请求跳过] ticket #{} 已有待确认操作，跳过重复请求 (request_id={})",
+                    request.ticket,
+                    request_id
+                );
+                return Ok((request_id, true)); // 重复操作
+            }
+        }
+
         tracing::info!(
-            "Sending trade: {:?} {} {} lots @ {}",
+            "📤 [发送请求] request_id={}, type={}, {:?} {} {} lots @ {}, ticket={}",
+            request_id,
+            request.trade_type,
             request.order_type,
             request.symbol,
             request.volume,
-            request.price
+            request.price,
+            request.ticket
         );
-        let data = request.to_bytes();
-        self.send_command(Command::TradeRequest, &data).await
+
+        // 3. 添加到待确认队列 (对应 JS: N[b.kj] = b; E[b.R] = b.kj;)
+        self.request_tracker.add_pending(request.clone()).await;
+
+        // 4. 发送请求
+        let result = self.send_trade_internal(&request).await;
+
+        if let Err(ref e) = result {
+            // 发送失败，从待确认队列移除
+            tracing::error!("❌ [发送失败] request_id={}: {}", request_id, e);
+            self.request_tracker.confirm(request_id).await;
+        }
+
+        result.map(|_| (request_id, false))
+    }
+
+    /// 发送交易请求 (简化版，兼容旧接口)
+    /// 返回 Result<()>，隐藏 request_id 和重复检测
+    pub async fn send_trade_simple(&self, request: TradeRequest) -> Result<()> {
+        let (_, is_duplicate) = self.send_trade(request).await?;
+        if is_duplicate {
+            // 对于简化接口，重复操作视为成功（已有请求在处理中）
+            Ok(())
+        } else {
+            Ok(())
+        }
     }
 
     /// 市价买入
     pub async fn buy(&self, symbol: &str, volume: f64, sl: Option<f64>, tp: Option<f64>) -> Result<()> {
         let request = TradeRequest::buy(symbol, volume, sl.unwrap_or(0.0), tp.unwrap_or(0.0));
-        self.send_trade(request).await
+        self.send_trade_simple(request).await
     }
 
     /// 市价卖出
     pub async fn sell(&self, symbol: &str, volume: f64, sl: Option<f64>, tp: Option<f64>) -> Result<()> {
         let request = TradeRequest::sell(symbol, volume, sl.unwrap_or(0.0), tp.unwrap_or(0.0));
-        self.send_trade(request).await
+        self.send_trade_simple(request).await
     }
 
     /// 限价买入
@@ -641,7 +950,7 @@ impl Mt4Client {
         tp: Option<f64>,
     ) -> Result<()> {
         let request = TradeRequest::buy_limit(symbol, volume, price, sl.unwrap_or(0.0), tp.unwrap_or(0.0));
-        self.send_trade(request).await
+        self.send_trade_simple(request).await
     }
 
     /// 限价卖出
@@ -654,7 +963,7 @@ impl Mt4Client {
         tp: Option<f64>,
     ) -> Result<()> {
         let request = TradeRequest::sell_limit(symbol, volume, price, sl.unwrap_or(0.0), tp.unwrap_or(0.0));
-        self.send_trade(request).await
+        self.send_trade_simple(request).await
     }
 
     /// 平仓 (需要传入原订单方向，以便发送反向平仓)
@@ -664,14 +973,14 @@ impl Mt4Client {
             "Sending close: ticket={}, symbol={}, volume={}",
             ticket, symbol, volume
         );
-        self.send_trade(request).await
+        self.send_trade_simple(request).await
     }
 
     /// 取消挂单
     pub async fn cancel_order(&self, ticket: i32, symbol: &str) -> Result<()> {
         let request = TradeRequest::cancel(ticket, symbol);
         tracing::info!("Sending cancel: ticket={}, symbol={}", ticket, symbol);
-        self.send_trade(request).await
+        self.send_trade_simple(request).await
     }
 
     /// 发送 Ping

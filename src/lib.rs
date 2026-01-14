@@ -39,7 +39,7 @@ pub mod protocol;
 pub mod types;
 
 pub use api::Mt4Api;
-pub use client::{Mt4Client, Mt4Event};
+pub use client::{Mt4Client, Mt4Event, PendingRequest, RequestTracker};
 pub use error::{Mt4Error, Result};
 pub use protocol::{Command, OrderType, TradeType};
 pub use types::*;
